@@ -88,10 +88,11 @@ def parse_args() -> argparse.Namespace:
     # Infrastructure
     p.add_argument("--device",       type=str, default="auto",
                    choices=["auto", "cuda", "cpu"])
-    p.add_argument("--num-workers",  type=int, default=0)
+    p.add_argument("--num-workers",  type=int, default=4)
     p.add_argument("--output-dir",   type=Path, default=Path("outputs/v2/budget_128"))
     p.add_argument("--eval-every",   type=int, default=5)
     p.add_argument("--save-every",   type=int, default=10)
+    p.add_argument("--smoke-test",   action="store_true", help="Run 50 batches and report profiling")
 
     return p.parse_args()
 
@@ -137,6 +138,8 @@ def _get_lpips_model(device: torch.device):
     global _LPIPS_MODEL
     if _LPIPS_MODEL is None and HAS_LPIPS:
         _LPIPS_MODEL = _lpips_lib.LPIPS(net="alex", verbose=False).to(device)
+        for p in _LPIPS_MODEL.parameters():
+            p.requires_grad = False
         _LPIPS_MODEL.eval()
     return _LPIPS_MODEL
 
@@ -153,12 +156,12 @@ def compute_loss(
 
     Returns (total_loss, breakdown_dict).
     """
-    breakdown: dict[str, float] = {}
+    breakdown: dict[str, torch.Tensor] = {}
 
     # L1 pixel loss
     l1 = F.l1_loss(recon, target)
     total = args.lambda_l1 * l1
-    breakdown["l1"] = float(l1.detach())
+    breakdown["l1"] = l1.detach()
 
     # MS-SSIM (minimize 1 - MS_SSIM since MS_SSIM ∈ [0,1], higher is better)
     if HAS_MSSSIM and args.lambda_msssim > 0:
@@ -167,7 +170,7 @@ def compute_loss(
             ms = _ms_ssim(recon, target, data_range=1.0, size_average=True, win_size=7)
             ms_loss = 1.0 - ms
             total = total + args.lambda_msssim * ms_loss
-            breakdown["ms_ssim_loss"] = float(ms_loss.detach())
+            breakdown["ms_ssim_loss"] = ms_loss.detach()
     else:
         # Fall back to gradient-based structural loss
         dx_r = recon[:, :, :, 1:] - recon[:, :, :, :-1]
@@ -176,7 +179,7 @@ def compute_loss(
         dy_t = target[:, :, 1:, :] - target[:, :, :-1, :]
         grad_loss = F.l1_loss(dx_r, dx_t) + F.l1_loss(dy_r, dy_t)
         total = total + args.lambda_msssim * grad_loss
-        breakdown["grad_loss"] = float(grad_loss.detach())
+        breakdown["grad_loss"] = grad_loss.detach()
 
     # LPIPS perceptual loss
     if HAS_LPIPS and args.lambda_lpips > 0:
@@ -184,16 +187,16 @@ def compute_loss(
         # LPIPS expects input in [-1, 1]
         r_lpips = recon  * 2.0 - 1.0
         t_lpips = target * 2.0 - 1.0
-        with torch.no_grad() if False else torch.enable_grad():
+        with torch.enable_grad():
             lp = lpips_model(r_lpips, t_lpips).mean()
         total = total + args.lambda_lpips * lp
-        breakdown["lpips"] = float(lp.detach())
+        breakdown["lpips"] = lp.detach()
 
     # VQ commitment losses
     total = total + args.lambda_sem_vq * sem_vq_loss + args.lambda_det_vq * det_vq_loss
-    breakdown["sem_vq"] = float(sem_vq_loss.detach())
-    breakdown["det_vq"] = float(det_vq_loss.detach())
-    breakdown["total"]  = float(total.detach())
+    breakdown["sem_vq"] = sem_vq_loss.detach()
+    breakdown["det_vq"] = det_vq_loss.detach()
+    breakdown["total"]  = total.detach()
 
     return total, breakdown
 
@@ -223,34 +226,64 @@ def train_one_epoch(
     epoch: int,
 ) -> dict[str, float]:
     model.train()
-    totals: dict[str, float] = {}
+    totals: dict[str, torch.Tensor] = {}
     n_batches = 0
     t0 = time.time()
+    t_last = t0
+    times = {"data": 0.0, "fwd": 0.0, "loss": 0.0, "bwd": 0.0, "opt": 0.0}
 
     for batch in loader:
+        t_data = time.time()
+        times["data"] += (t_data - t_last)
         images = batch["image"].to(device, non_blocking=True)
 
         with torch.amp.autocast(device_type=device.type, enabled=(device.type == "cuda")):
             out = model(images)
+            if device.type == "cuda" and args.smoke_test: torch.cuda.synchronize()
+            t_fwd = time.time()
+            times["fwd"] += (t_fwd - t_data)
+
             loss, breakdown = compute_loss(
                 out["reconstruction"], images,
                 out["sem_vq_loss"], out["det_vq_loss"],
                 args, device,
             )
+            if device.type == "cuda" and args.smoke_test: torch.cuda.synchronize()
+            t_loss = time.time()
+            times["loss"] += (t_loss - t_fwd)
 
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
+        if device.type == "cuda" and args.smoke_test: torch.cuda.synchronize()
+        t_bwd = time.time()
+        times["bwd"] += (t_bwd - t_loss)
+
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         scaler.step(optimizer)
         scaler.update()
+        if device.type == "cuda" and args.smoke_test: torch.cuda.synchronize()
+        t_opt = time.time()
+        times["opt"] += (t_opt - t_bwd)
 
         for k, v in breakdown.items():
             totals[k] = totals.get(k, 0.0) + v
         n_batches += 1
+        t_last = time.time()
+
+        if args.smoke_test and n_batches >= 50:
+            break
 
     elapsed = time.time() - t0
-    return {k: v / max(n_batches, 1) for k, v in totals.items()} | {"epoch_secs": elapsed}
+    if args.smoke_test:
+        print(f"\n--- Profiling (50 batches) ---")
+        for k, v in times.items():
+            print(f"  {k:4s}: {v:.2f}s ({v/50*1000:.1f}ms/batch)")
+        print(f"  Total time for 50 batches: {elapsed:.2f}s ({(50/elapsed):.1f} batches/sec)")
+        print(f"  Estimated full epoch (~915 batches): {elapsed * (915/50) / 60:.1f} minutes")
+        print("------------------------------")
+    times_str = f"data={times['data']:.1f}s fwd={times['fwd']:.1f}s loss={times['loss']:.1f}s bwd={times['bwd']:.1f}s opt={times['opt']:.1f}s"
+    return {k: float(v) / max(n_batches, 1) for k, v in totals.items()} | {"epoch_secs": elapsed, "timing_str": times_str}
 
 
 @torch.no_grad()
@@ -353,10 +386,14 @@ def main() -> None:
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
         num_workers=args.num_workers, pin_memory=pin, drop_last=True,
+        persistent_workers=(args.num_workers > 0),
+        prefetch_factor=2 if args.num_workers > 0 else None,
     )
     val_loader = DataLoader(
         val_ds, batch_size=args.batch_size, shuffle=False,
         num_workers=args.num_workers, pin_memory=pin,
+        persistent_workers=(args.num_workers > 0),
+        prefetch_factor=2 if args.num_workers > 0 else None,
     )
     print(f"Train: {len(train_ds)} | Val: {len(val_ds)}")
 
@@ -431,7 +468,8 @@ def main() -> None:
             f"L1={row['train_l1']:.4f} | "
             f"Val_PSNR={val_metrics['val_psnr']:.2f}dB | "
             f"LR={lr:.2e} | "
-            f"{row['secs']:.1f}s"
+            f"{row['secs']:.1f}s | "
+            f"[{train_metrics['timing_str']}]"
         )
 
         # Full payload PSNR every eval_every epochs
