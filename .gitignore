@@ -1,3 +1,18 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# Datasets
+datasets/
+*.jpg
+*.jpeg
+*.png
+*.webp
+
+# ML artifacts
+checkpoints/
+outputs/
+*.pt
+*.pth
+*.ckpt
+*.onnx
