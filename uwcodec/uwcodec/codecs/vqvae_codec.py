@@ -89,6 +89,7 @@ class MinimalVQVAE(nn.Module):
         decoder_channels: list[int] | None = None,
         output_size: int = 128,
         num_res_blocks: int = 2,
+        target_vq_tokens: int | None = None,
     ):
         super().__init__()
 
@@ -109,6 +110,16 @@ class MinimalVQVAE(nn.Module):
             enc_out = self.encoder(dummy)
         self.spatial_h, self.spatial_w = enc_out.shape[2], enc_out.shape[3]
         self.num_spatial_positions = self.spatial_h * self.spatial_w
+        
+        # Budget projection if needed
+        self.target_vq_tokens = target_vq_tokens
+        if target_vq_tokens is not None and target_vq_tokens != self.num_spatial_positions:
+            self.budget_proj_enc = nn.Linear(self.num_spatial_positions, target_vq_tokens)
+            self.budget_proj_dec = nn.Linear(target_vq_tokens, self.num_spatial_positions)
+        else:
+            self.budget_proj_enc = None
+            self.budget_proj_dec = None
+            self.target_vq_tokens = self.num_spatial_positions
 
         # Vector quantizer (codebook_size=256 → 1 byte per index)
         self.quantizer = VectorQuantizer(
@@ -142,8 +153,32 @@ class MinimalVQVAE(nn.Module):
         Returns:
             Dict with reconstruction, vq_loss, perplexity.
         """
-        z = self.encoder(images)
-        z_q, vq_info = self.quantizer(z)
+        z = self.encoder(images)  # (B, D, H', W')
+        B, D, H, W = z.shape
+        
+        # Apply budget projection if needed
+        if self.budget_proj_enc is not None:
+            # Flatten spatial dims: (B, D, H*W) -> (B, D, N)
+            z_flat = z.view(B, D, H * W)
+            # Project to target tokens: (B, D, T)
+            z_proj = self.budget_proj_enc(z_flat)
+            # Reshape back to pseudo-spatial for Quantizer (B, D, T, 1)
+            z_for_vq = z_proj.unsqueeze(-1)
+        else:
+            z_for_vq = z
+            
+        z_q_proj, vq_info = self.quantizer(z_for_vq)
+        
+        # Inverse projection
+        if self.budget_proj_dec is not None:
+            # z_q_proj is (B, D, T, 1) -> flat (B, D, T)
+            z_q_flat = z_q_proj.squeeze(-1)
+            # Project back to spatial: (B, D, H*W)
+            z_q_spatial = self.budget_proj_dec(z_q_flat)
+            z_q = z_q_spatial.view(B, D, H, W)
+        else:
+            z_q = z_q_proj
+
         recon = self.decoder(z_q)
 
         return {
@@ -177,10 +212,22 @@ class MinimalVQVAE(nn.Module):
 
         with torch.no_grad():
             z = self.encoder(x)
-            z_q, vq_info = self.quantizer(z)
+            B, D, H, W = z.shape
+            
+            # Apply budget projection if needed
+            if self.budget_proj_enc is not None:
+                z_flat = z.view(B, D, H * W)
+                z_proj = self.budget_proj_enc(z_flat)
+                z_for_vq = z_proj.unsqueeze(-1)
+            else:
+                z_for_vq = z
+                
+            z_q, vq_info = self.quantizer(z_for_vq)
 
-        indices = vq_info["indices"]  # (1, H', W')
+        indices = vq_info["indices"]  # (1, T, 1) or (1, H', W')
         vq_budget = PayloadConfig().vq_bytes(max_bytes)
+        
+        # Serialize exactly target_vq_tokens or vq_budget
         vq_data = _serialize_indices(indices, vq_budget)
 
         payload = self._payload_format.pack(vq_data, max_bytes)
@@ -210,16 +257,32 @@ class MinimalVQVAE(nn.Module):
         else:
             raise TypeError(f"Expected bytes or EncodedPayload, got {type(payload)}")
 
+        if self.budget_proj_dec is not None:
+            spatial_shape = (self.target_vq_tokens, 1)
+        else:
+            spatial_shape = (self.spatial_h, self.spatial_w)
+
         indices = _deserialize_indices(
-            vq_data, (self.spatial_h, self.spatial_w)
+            vq_data, spatial_shape
         ).to(device)
 
         with torch.no_grad():
-            z_q = self.quantizer.indices_to_codes(indices)
-            # Reshape to (B, D, H', W')
+            z_q_proj = self.quantizer.indices_to_codes(indices)
+            
+            # Reshape to (B, D, H', W') or (B, D, T, 1)
             B, H, W = indices.shape
             D = self.quantizer.codebook_dim
-            z_q = z_q.reshape(B, H, W, D).permute(0, 3, 1, 2)
+            z_q_proj = z_q_proj.reshape(B, H, W, D).permute(0, 3, 1, 2)
+            
+            if self.budget_proj_dec is not None:
+                # z_q_proj is (B, D, T, 1) -> flat (B, D, T)
+                z_q_flat = z_q_proj.squeeze(-1)
+                # Project back to spatial: (B, D, H*W)
+                z_q_spatial = self.budget_proj_dec(z_q_flat)
+                z_q = z_q_spatial.view(B, D, self.spatial_h, self.spatial_w)
+            else:
+                z_q = z_q_proj
+                
             recon = self.decoder(z_q)
 
         img = (recon[0].permute(1, 2, 0).cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
@@ -237,6 +300,7 @@ class MinimalVQVAE(nn.Module):
                 "codebook_size": self.codebook_size,
                 "spatial_h": self.spatial_h,
                 "spatial_w": self.spatial_w,
+                "target_vq_tokens": self.target_vq_tokens,
             },
         }, path)
         print(f"Saved codec to {path}")
@@ -250,6 +314,7 @@ class MinimalVQVAE(nn.Module):
             input_size=config.get("input_size", 128),
             output_size=config.get("output_size", 128),
             codebook_size=config.get("codebook_size", 256),
+            target_vq_tokens=config.get("target_vq_tokens", None),
             **kwargs,
         )
         model.load_state_dict(ckpt["model_state_dict"])

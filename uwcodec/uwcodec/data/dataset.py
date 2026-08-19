@@ -406,3 +406,47 @@ def _augment(img: np.ndarray) -> np.ndarray:
     img = np.clip(img_f, 0, 255).astype(np.uint8)
 
     return img
+
+
+class MultiDatasetLoader:
+    """Loader for EUVP, SUIM, UIEB to prevent cross-dataset leakage."""
+
+    def __init__(self, datasets_root: str | Path):
+        self.root = Path(datasets_root)
+        
+    def get_dataset(
+        self,
+        name: str,
+        split: str,
+        input_size: int = 128,
+        augment: bool = False,
+        color_correction: str = "gray_world"
+    ) -> UnderwaterImageDataset:
+        """Get a specific dataset and split."""
+        dataset_dir = self.root / name.upper()
+        if not dataset_dir.exists():
+            raise FileNotFoundError(f"Dataset {name.upper()} not found at {dataset_dir}")
+            
+        # Map split names based on dataset conventions
+        if name.upper() == "UIEB":
+            if split == "train":
+                raise ValueError("UIEB is strictly for independent evaluation (no train split).")
+            # UIEB uses 'images' instead of 'test'/'val'
+            search_dir = dataset_dir / "images"
+        else:
+            # EUVP and SUIM have train/val/test
+            search_dir = dataset_dir / split
+            
+        if not search_dir.exists():
+            raise FileNotFoundError(f"Split {split} not found at {search_dir}")
+            
+        paths = find_images(search_dir)
+        if not paths:
+            raise ValueError(f"No images found in {search_dir}")
+            
+        return UnderwaterImageDataset(
+            paths=paths,
+            input_size=input_size,
+            augment=augment,
+            color_correction=color_correction,
+        )

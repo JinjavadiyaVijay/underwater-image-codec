@@ -134,13 +134,17 @@ def compute_ms_ssim(original: np.ndarray, reconstructed: np.ndarray) -> float:
         img1 = torch.from_numpy(original).permute(2, 0, 1).unsqueeze(0).float() / 255.0
         img2 = torch.from_numpy(reconstructed).permute(2, 0, 1).unsqueeze(0).float() / 255.0
 
-        # MS-SSIM requires minimum size for multi-scale
+        # MS-SSIM requires minimum size for multi-scale depending on win_size
         min_dim = min(img1.shape[2], img1.shape[3])
-        if min_dim < 64:
+        if min_dim < 33:
             # Fall back to single-scale SSIM for tiny images
             return compute_ssim(original, reconstructed)
-
-        return float(ms_ssim(img1, img2, data_range=1.0))
+        elif min_dim < 97:
+            return float(ms_ssim(img1, img2, data_range=1.0, win_size=3))
+        elif min_dim < 161:
+            return float(ms_ssim(img1, img2, data_range=1.0, win_size=7))
+        else:
+            return float(ms_ssim(img1, img2, data_range=1.0))
     except ImportError:
         # Fallback to standard SSIM
         return compute_ssim(original, reconstructed)

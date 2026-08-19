@@ -58,7 +58,7 @@ class BioCLIPTeacher:
 
             if self._weights_path:
                 model, _, preprocess = open_clip.create_model_and_transforms(
-                    "ViT-B-16", pretrained=str(self._weights_path)
+                    "ViT-B-16", weights=str(self._weights_path)
                 )
             else:
                 model, _, preprocess = open_clip.create_model_and_transforms(

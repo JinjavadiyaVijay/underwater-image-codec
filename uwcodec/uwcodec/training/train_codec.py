@@ -32,12 +32,15 @@ from torch.utils.data import DataLoader
 
 def parse_args():
     p = argparse.ArgumentParser(description="Train UWCodec VQ-VAE")
-    p.add_argument("--data-dir", type=Path, default=None)
+    p.add_argument("--dataset", type=str, default="euvp", choices=["euvp", "suim", "uieb"])
+    p.add_argument("--datasets-root", type=Path, default=Path("datasets"))
     p.add_argument("--synthetic", action="store_true", help="Use synthetic data for testing")
-    p.add_argument("--num-images", type=int, default=500, help="Max images to use")
+    p.add_argument("--num-images", type=int, default=2000, help="Max images to use")
     p.add_argument("--input-size", type=int, default=128, help="Encoder input resolution")
     p.add_argument("--output-size", type=int, default=128, help="Decoder output resolution")
-    p.add_argument("--epochs", type=int, default=50)
+    p.add_argument("--hidden-channels", type=int, default=32, help="Number of hidden channels in encoder/decoder")
+    p.add_argument("--num-res-blocks", type=int, default=2, help="Number of residual blocks")
+    p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--lambda-pixel", type=float, default=1.0)
@@ -55,31 +58,52 @@ def parse_args():
 
 def build_dataset(args):
     """Build train/val datasets."""
-    from uwcodec.data.dataset import UnderwaterImageDataset, create_synthetic_dataset
+    from uwcodec.data.dataset import UnderwaterImageDataset, create_synthetic_dataset, MultiDatasetLoader
 
-    if args.synthetic or args.data_dir is None:
+    if args.synthetic:
         import tempfile
         tmp = Path(tempfile.mkdtemp()) / "synthetic"
         print(f"Generating synthetic dataset ({args.num_images} images)...")
         create_synthetic_dataset(tmp, num_images=args.num_images, image_size=args.input_size * 2)
-        data_dir = tmp
+        
+        train_ds = UnderwaterImageDataset.from_directory(
+            root=tmp,
+            input_size=args.input_size,
+            split="train",
+            augment=True,
+            verbose=True,
+        )
+        val_ds = UnderwaterImageDataset.from_directory(
+            root=tmp,
+            input_size=args.input_size,
+            split="val",
+            augment=False,
+            verbose=False,
+        )
     else:
-        data_dir = args.data_dir
-
-    train_ds = UnderwaterImageDataset.from_directory(
-        root=data_dir,
-        input_size=args.input_size,
-        split="train",
-        augment=True,
-        verbose=True,
-    )
-    val_ds = UnderwaterImageDataset.from_directory(
-        root=data_dir,
-        input_size=args.input_size,
-        split="val",
-        augment=False,
-        verbose=False,
-    )
+        print(f"Loading {args.dataset.upper()} from {args.datasets_root}...")
+        loader = MultiDatasetLoader(args.datasets_root)
+        train_ds = loader.get_dataset(
+            name=args.dataset,
+            split="train",
+            input_size=args.input_size,
+            augment=True
+        )
+        val_ds = loader.get_dataset(
+            name=args.dataset,
+            split="val",
+            input_size=args.input_size,
+            augment=False
+        )
+        
+        # Subsample if requested
+        if args.num_images > 0:
+            if len(train_ds) > args.num_images:
+                train_ds.paths = train_ds.paths[:args.num_images]
+            val_limit = max(10, int(args.num_images * 0.1))
+            if len(val_ds) > val_limit:
+                val_ds.paths = val_ds.paths[:val_limit]
+                
     return train_ds, val_ds
 
 
@@ -103,7 +127,7 @@ def compute_perceptual_loss(recon: torch.Tensor, target: torch.Tensor) -> torch.
     return nn.functional.l1_loss(grad_recon, grad_target)
 
 
-def train_one_epoch(model, loader, optimizer, device, args) -> dict:
+def train_one_epoch(model, loader, optimizer, device, args, scaler=None) -> dict:
     model.train()
     total_pixel = 0.0
     total_perceptual = 0.0
@@ -111,26 +135,36 @@ def train_one_epoch(model, loader, optimizer, device, args) -> dict:
     total_loss = 0.0
     n_batches = 0
 
+    use_amp = (scaler is not None and device == "cuda")
+
     for batch in loader:
         images = batch["image"].to(device)
 
         optimizer.zero_grad()
-        out = model(images)
+        
+        with torch.autocast(device_type="cuda" if device == "cuda" else "cpu", enabled=use_amp):
+            out = model(images)
+            recon = out["reconstruction"]
+            pixel_loss = nn.functional.l1_loss(recon, images)
+            perceptual_loss = compute_perceptual_loss(recon, images)
+            vq_loss = out["vq_loss"]
 
-        recon = out["reconstruction"]
-        pixel_loss = nn.functional.l1_loss(recon, images)
-        perceptual_loss = compute_perceptual_loss(recon, images)
-        vq_loss = out["vq_loss"]
+            loss = (
+                args.lambda_pixel * pixel_loss
+                + args.lambda_perceptual * perceptual_loss
+                + args.lambda_vq * vq_loss
+            )
 
-        loss = (
-            args.lambda_pixel * pixel_loss
-            + args.lambda_perceptual * perceptual_loss
-            + args.lambda_vq * vq_loss
-        )
-
-        loss.backward()
-        nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+        if use_amp:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
 
         total_pixel += pixel_loss.item()
         total_perceptual += perceptual_loss.item()
@@ -156,7 +190,8 @@ def validate(model, loader, device) -> dict:
 
     for batch in loader:
         images = batch["image"].to(device)
-        out = model(images)
+        with torch.autocast(device_type="cuda" if device == "cuda" else "cpu", enabled=(device=="cuda")):
+            out = model(images)
         total_pixel += nn.functional.l1_loss(out["reconstruction"], images).item()
         n_batches += 1
 
@@ -193,11 +228,26 @@ def main():
     args = parse_args()
 
     # Device
+    has_cuda = torch.cuda.is_available()
+    if args.device == "cuda" and not has_cuda:
+        raise RuntimeError("ERROR: CUDA requested but not available. Failing fast to prevent silent CPU training.")
+    
     if args.device == "auto":
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = "cuda" if has_cuda else "cpu"
     else:
         device = args.device
-    print(f"Device: {device}")
+
+    print("=" * 70)
+    print("DEVICE DIAGNOSTICS")
+    print("=" * 70)
+    print(f"Target Device:  {device.upper()}")
+    if device == "cuda":
+        print(f"CUDA Available: {has_cuda}")
+        print(f"GPU Name:       {torch.cuda.get_device_name(0)}")
+        print(f"CUDA Version:   {torch.version.cuda}")
+    else:
+        print("WARNING: Running on CPU. This will be extremely slow for training.")
+    print("=" * 70)
 
     # Output dir
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -223,9 +273,23 @@ def main():
 
     # Model
     from uwcodec.codecs.vqvae_codec import MinimalVQVAE
+    
+    # Scale channels based on hidden_channels
+    hc = args.hidden_channels
+    encoder_ch = [hc, hc*2, hc*4, hc*8]
+    decoder_ch = [hc*8, hc*4, hc*2, hc]
+    
+    from uwcodec.core.config import PayloadConfig
+    pc = PayloadConfig()
+    target_vq = pc.vq_bytes(args.train_budget)
+    
     model = MinimalVQVAE(
         input_size=args.input_size,
         output_size=args.output_size,
+        encoder_channels=encoder_ch,
+        decoder_channels=decoder_ch,
+        num_res_blocks=args.num_res_blocks,
+        target_vq_tokens=target_vq,
     ).to(device)
 
     params = model.count_parameters()
@@ -241,13 +305,20 @@ def main():
     print(f"\nByte budget info:")
     for b in [64, 96, 124, 256]:
         vq_b = pc.vq_bytes(b)
-        n_pos = model.num_spatial_positions
-        print(f"  {b:4d}B: {vq_b}B VQ, {n_pos} spatial positions, "
-              f"{'fits' if vq_b >= n_pos else 'TRUNCATED — only ' + str(vq_b) + '/' + str(n_pos) + ' positions'}")
+        n_pos = 64  # Standard 8x8 spatial grid from MobileNet-style encoder
+        if vq_b == n_pos:
+            status = "fits perfectly"
+        elif vq_b < n_pos:
+            status = f"PROJECTED ({n_pos} -> {vq_b} tokens)"
+        else:
+            status = f"PROJECTED ({n_pos} -> {vq_b} tokens)"
+            
+        print(f"  {b:4d}B: {vq_b}B VQ, {n_pos} spatial positions, {status}")
 
-    # Optimizer + scheduler
+    # Optimizer + scheduler + AMP Scaler
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    scaler = torch.amp.GradScaler(device="cuda") if device == "cuda" else None
 
     # Training loop
     print(f"\nStarting training: {args.epochs} epochs")
@@ -259,7 +330,7 @@ def main():
 
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
-        train_metrics = train_one_epoch(model, train_loader, optimizer, device, args)
+        train_metrics = train_one_epoch(model, train_loader, optimizer, device, args, scaler=scaler)
         val_metrics = validate(model, val_loader, device)
         scheduler.step()
 

@@ -37,7 +37,7 @@ def compressai_encode_decode(
         from compressai.zoo import models
 
         # Load model
-        model = models[model_name](quality=quality, pretrained=True)
+        model = models[model_name](quality=quality, weights="DEFAULT")
         model.eval()
         model.update()
 

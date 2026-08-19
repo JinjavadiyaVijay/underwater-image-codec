@@ -3,6 +3,21 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# Datasets
+datasets/
+*.jpg
+*.jpeg
+*.png
+*.webp
+
+# ML artifacts
+checkpoints/
+outputs/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
 # C extensions
 *.so
 
@@ -216,3 +231,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Datasets (external to repo)
+datasets/
