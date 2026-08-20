@@ -9,7 +9,7 @@ from tqdm import tqdm
 
 from uwcodec.codecs.v2_codec import UWCodecV2
 from uwcodec.data.dataset import MultiDatasetLoader
-from uwcodec.metrics.metrics import image_psnr, image_ssim, image_uciqe
+from uwcodec.evaluation.metrics import compute_psnr, compute_ssim, compute_uciqe
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -47,9 +47,18 @@ def main():
     except ImportError:
         dists_model = None
 
-    for x_np, _ in tqdm(loader, desc="Evaluating"):
-        # x_np is (1, H, W, 3) uint8
-        x = x_np[0].numpy()
+    for batch in tqdm(loader, desc="Evaluating"):
+        x_np = batch[0]
+
+        if isinstance(x_np, torch.Tensor):
+            x = x_np[0].cpu().numpy()
+        elif isinstance(x_np, np.ndarray):
+            x = x_np[0] if x_np.ndim == 4 else x_np
+        elif isinstance(x_np, (str, Path)):
+            from PIL import Image
+            x = np.array(Image.open(x_np).convert("RGB"))
+        else:
+            raise TypeError(f"Unsupported dataset image type: {type(x_np)}")
         
         # Encode -> payload -> Decode
         payload = codec.encode(x)
