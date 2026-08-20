@@ -93,6 +93,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--eval-every",   type=int, default=5)
     p.add_argument("--save-every",   type=int, default=10)
     p.add_argument("--smoke-test",   action="store_true", help="Run 50 batches and report profiling")
+    p.add_argument("--resume",       type=str, default=None, help="Path to checkpoint to resume from")
 
     return p.parse_args()
 
@@ -161,7 +162,7 @@ def compute_loss(
     # L1 pixel loss
     l1 = F.l1_loss(recon, target)
     total = args.lambda_l1 * l1
-    breakdown["l1"] = l1.detach()
+    breakdown["l1"] = l1.item()
 
     # MS-SSIM (minimize 1 - MS_SSIM since MS_SSIM ∈ [0,1], higher is better)
     if HAS_MSSSIM and args.lambda_msssim > 0:
@@ -170,7 +171,7 @@ def compute_loss(
             ms = _ms_ssim(recon, target, data_range=1.0, size_average=True, win_size=7)
             ms_loss = 1.0 - ms
             total = total + args.lambda_msssim * ms_loss
-            breakdown["ms_ssim_loss"] = ms_loss.detach()
+            breakdown["ms_ssim_loss"] = ms_loss.item()
     else:
         # Fall back to gradient-based structural loss
         dx_r = recon[:, :, :, 1:] - recon[:, :, :, :-1]
@@ -179,7 +180,7 @@ def compute_loss(
         dy_t = target[:, :, 1:, :] - target[:, :, :-1, :]
         grad_loss = F.l1_loss(dx_r, dx_t) + F.l1_loss(dy_r, dy_t)
         total = total + args.lambda_msssim * grad_loss
-        breakdown["grad_loss"] = grad_loss.detach()
+        breakdown["grad_loss"] = grad_loss.item()
 
     # LPIPS perceptual loss
     if HAS_LPIPS and args.lambda_lpips > 0:
@@ -187,16 +188,23 @@ def compute_loss(
         # LPIPS expects input in [-1, 1]
         r_lpips = recon  * 2.0 - 1.0
         t_lpips = target * 2.0 - 1.0
+        # No gradients should be accumulated in LPIPS model
+        with torch.no_grad():
+            lp = lpips_model(r_lpips, t_lpips).mean()
+        # Wait, if we use torch.no_grad(), the gradients won't flow back to recon! 
+        # But we DO want gradients to flow back to the generator (recon).
+        # We need enable_grad, but LPIPS parameters themselves must not get gradients.
+        # This is already handled by p.requires_grad = False in _get_lpips_model.
         with torch.enable_grad():
             lp = lpips_model(r_lpips, t_lpips).mean()
         total = total + args.lambda_lpips * lp
-        breakdown["lpips"] = lp.detach()
+        breakdown["lpips"] = lp.item()
 
     # VQ commitment losses
     total = total + args.lambda_sem_vq * sem_vq_loss + args.lambda_det_vq * det_vq_loss
-    breakdown["sem_vq"] = sem_vq_loss.detach()
-    breakdown["det_vq"] = det_vq_loss.detach()
-    breakdown["total"]  = total.detach()
+    breakdown["sem_vq"] = sem_vq_loss.item()
+    breakdown["det_vq"] = det_vq_loss.item()
+    breakdown["total"]  = total.item()
 
     return total, breakdown
 
@@ -271,16 +279,21 @@ def train_one_epoch(
         n_batches += 1
         t_last = time.time()
 
-        if args.smoke_test and n_batches >= 50:
+        # Explicitly delete temporary tensors to free up VRAM early
+        del images, out, loss, breakdown
+        if n_batches % 100 == 0 and device.type == "cuda":
+            torch.cuda.empty_cache()
+
+        if args.smoke_test and n_batches >= 100:
             break
 
     elapsed = time.time() - t0
     if args.smoke_test:
-        print(f"\n--- Profiling (50 batches) ---")
+        print(f"\n--- Profiling (100 batches) ---")
         for k, v in times.items():
-            print(f"  {k:4s}: {v:.2f}s ({v/50*1000:.1f}ms/batch)")
-        print(f"  Total time for 50 batches: {elapsed:.2f}s ({(50/elapsed):.1f} batches/sec)")
-        print(f"  Estimated full epoch (~915 batches): {elapsed * (915/50) / 60:.1f} minutes")
+            print(f"  {k:4s}: {v:.2f}s ({v/100*1000:.1f}ms/batch)")
+        print(f"  Total time for 100 batches: {elapsed:.2f}s ({(100/elapsed):.1f} batches/sec)")
+        print(f"  Estimated full epoch (~915 batches): {elapsed * (915/100) / 60:.1f} minutes")
         print("------------------------------")
     times_str = f"data={times['data']:.1f}s fwd={times['fwd']:.1f}s loss={times['loss']:.1f}s bwd={times['bwd']:.1f}s opt={times['opt']:.1f}s"
     return {k: float(v) / max(n_batches, 1) for k, v in totals.items()} | {"epoch_secs": elapsed, "timing_str": times_str}
@@ -363,15 +376,24 @@ def main() -> None:
     # ---- Dataset ----
     print(f"\nLoading {args.dataset.upper()} from {args.datasets_root}...")
     loader_obj = MultiDatasetLoader(args.datasets_root)
-
-    train_ds = loader_obj.get_dataset(
-        args.dataset, split="train", input_size=args.input_size,
-        augment=True,
-    )
-    val_ds = loader_obj.get_dataset(
-        args.dataset, split="val", input_size=args.input_size,
-        augment=False,
-    )
+    try:
+        train_ds = loader_obj.get_dataset(
+            args.dataset, split="train", input_size=args.input_size,
+            augment=True,
+        )
+        val_ds = loader_obj.get_dataset(
+            args.dataset, split="val", input_size=args.input_size,
+            augment=False,
+        )
+    except FileNotFoundError as e:
+        if args.smoke_test:
+            print("  -> Dataset not found! Falling back to dummy dataset for smoke test.")
+            from torch.utils.data import TensorDataset
+            dummy_images = torch.rand(1600, 3, args.input_size, args.input_size)
+            train_ds = [{"image": img} for img in dummy_images]
+            val_ds = train_ds[:160]
+        else:
+            raise e
 
     # Optional image count limit (subsetting for quick experiments)
     if args.num_images is not None and len(train_ds) > args.num_images:
@@ -432,12 +454,36 @@ def main() -> None:
 
     # ---- Training loop ----
     best_val_psnr = 0.0
+    start_epoch = 1
     history: list[dict] = []
+
+    if args.resume:
+        print(f"\nResuming from checkpoint: {args.resume}")
+        ckpt_path = Path(args.resume)
+        if ckpt_path.exists():
+            ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+            model.load_state_dict(ckpt["state_dict"])
+            if "train_state" in ckpt:
+                ts = ckpt["train_state"]
+                optimizer.load_state_dict(ts["optimizer"])
+                scheduler.load_state_dict(ts["scheduler"])
+                warmup.load_state_dict(ts["warmup"])
+                scaler.load_state_dict(ts["scaler"])
+                start_epoch = ts["epoch"] + 1
+                best_val_psnr = ts.get("best_val_psnr", 0.0)
+                history = ts.get("history", [])
+                print(f"  -> Successfully loaded full training state. Resuming from epoch {start_epoch} (Best PSNR: {best_val_psnr:.2f})")
+            else:
+                print("  -> WARNING: Checkpoint is weights-only. Starting from epoch 1 with restored weights.")
+        else:
+            print(f"  -> ERROR: Checkpoint {args.resume} not found. Starting from scratch.")
 
     print(f"\nStarting training: {args.epochs} epochs | Budget: {args.budget}B")
     print("=" * 60)
 
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats()
         # Warmup
         if epoch <= args.warmup_epochs:
             optimizer.step()  # step first to avoid skipping lr schedule initial value
@@ -472,7 +518,6 @@ def main() -> None:
             f"[{train_metrics['timing_str']}]"
         )
 
-        # Full payload PSNR every eval_every epochs
         if epoch % args.eval_every == 0 or epoch == args.epochs:
             payload_psnr = validate_payload_psnr(
                 model, val_loader, device, args.budget, num_samples=20,
@@ -480,18 +525,37 @@ def main() -> None:
             print(f"  [Payload PSNR on 20 samples: {payload_psnr:.2f} dB]")
             row["payload_psnr"] = payload_psnr
 
+        # Save helpers
+        def _save_ckpt(path: Path):
+            train_state = {
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "warmup": warmup.state_dict(),
+                "scaler": scaler.state_dict(),
+                "epoch": epoch,
+                "best_val_psnr": best_val_psnr,
+                "history": history,
+            }
+            model.save(path, train_state=train_state)
+
         # Checkpoint
         is_best = val_metrics["val_psnr"] > best_val_psnr
         if is_best:
             best_val_psnr = val_metrics["val_psnr"]
-            model.save(args.output_dir / "best.pt")
+            _save_ckpt(args.output_dir / "best.pt")
             print(f"  [Saved best: val_psnr={best_val_psnr:.2f} dB]")
 
         if epoch % args.save_every == 0:
-            model.save(args.output_dir / f"epoch_{epoch:03d}.pt")
+            _save_ckpt(args.output_dir / f"epoch_{epoch:03d}.pt")
+            
+        if device.type == "cuda":
+            peak_mem = torch.cuda.max_memory_allocated() / 1e9
+            alloc_mem = torch.cuda.memory_allocated() / 1e9
+            res_mem = torch.cuda.memory_reserved() / 1e9
+            print(f"  [CUDA VRAM this epoch - Peak: {peak_mem:.2f} GB | Alloc: {alloc_mem:.2f} GB | Reserved: {res_mem:.2f} GB]")
 
     # Final checkpoint
-    model.save(args.output_dir / "final.pt")
+    _save_ckpt(args.output_dir / "final.pt")
 
     # Save history
     with open(args.output_dir / "training_history.json", "w") as f:

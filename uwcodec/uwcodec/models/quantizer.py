@@ -71,7 +71,8 @@ class VectorQuantizer(nn.Module):
             self._ema_cluster_size.mul_(self.decay).add_(
                 encodings.sum(0), alpha=1 - self.decay
             )
-            dw = encodings.t() @ z_flat
+            # EMA weight update (must detach z_flat to avoid memory leak in autograd graph)
+            dw = encodings.t() @ z_flat.detach()
             self._ema_w.mul_(self.decay).add_(dw, alpha=1 - self.decay)
 
             n = self._ema_cluster_size.sum()

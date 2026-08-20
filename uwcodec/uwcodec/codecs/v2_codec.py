@@ -402,11 +402,11 @@ class UWCodecV2(nn.Module):
     # Checkpoint I/O
     # ------------------------------------------------------------------
 
-    def save(self, path: str | Path) -> None:
+    def save(self, path: str | Path, train_state: dict | None = None) -> None:
         """Save model weights + config to a single checkpoint file."""
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save({
+        save_dict = {
             "state_dict": self.state_dict(),
             "config": {
                 "budget":                 self.budget,
@@ -418,7 +418,10 @@ class UWCodecV2(nn.Module):
                 "num_res_blocks_bottom":  self._num_res_blocks_bottom,
                 "num_res_blocks_mid":     self._num_res_blocks_mid,
             },
-        }, path)
+        }
+        if train_state is not None:
+            save_dict["train_state"] = train_state
+        torch.save(save_dict, path)
 
     @classmethod
     def load(cls, path: str | Path, device: str = "cpu") -> "UWCodecV2":
