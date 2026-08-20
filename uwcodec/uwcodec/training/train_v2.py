@@ -256,6 +256,11 @@ def train_one_epoch(
                 out["sem_vq_loss"], out["det_vq_loss"],
                 args, device,
             )
+            breakdown["sem_perp"] = out["sem_perplexity"].item()
+            breakdown["det_perp"] = out["det_perplexity"].item()
+            breakdown["sem_act"] = out["sem_active_codes"]
+            breakdown["det_act"] = out["det_active_codes"]
+            
             if device.type == "cuda" and args.smoke_test: torch.cuda.synchronize()
             t_loss = time.time()
             times["loss"] += (t_loss - t_fwd)
@@ -501,7 +506,10 @@ def main() -> None:
             "epoch": epoch,
             "train_loss": train_metrics.get("total", 0),
             "train_l1": train_metrics.get("l1", 0),
-            "sem_perp": train_metrics.get("sem_vq", 0),
+            "sem_perp": train_metrics.get("sem_perp", 0),
+            "det_perp": train_metrics.get("det_perp", 0),
+            "sem_act": train_metrics.get("sem_act", 0),
+            "det_act": train_metrics.get("det_act", 0),
             **val_metrics,
             "lr": lr,
             "secs": train_metrics.get("epoch_secs", 0),
@@ -513,9 +521,10 @@ def main() -> None:
             f"Loss={row['train_loss']:.4f} | "
             f"L1={row['train_l1']:.4f} | "
             f"Val_PSNR={val_metrics['val_psnr']:.2f}dB | "
+            f"Perp(S/D)={row['sem_perp']:.1f}/{row['det_perp']:.1f} | "
+            f"Act(S/D)={row['sem_act']:.1f}/{row['det_act']:.1f} | "
             f"LR={lr:.2e} | "
-            f"{row['secs']:.1f}s | "
-            f"[{train_metrics['timing_str']}]"
+            f"{row['secs']:.1f}s"
         )
 
         if epoch % args.eval_every == 0 or epoch == args.epochs:

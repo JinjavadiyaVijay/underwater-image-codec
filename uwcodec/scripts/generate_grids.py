@@ -37,15 +37,18 @@ def main():
     
     pairs = []
     
-    for i, (x_np, _) in enumerate(loader):
+    for i, batch in enumerate(loader):
         if i >= args.num_images:
             break
             
-        x = x_np[0].numpy()  # (H, W, 3) uint8
+        x_t = batch["image"]
+        if x_t.ndim == 4: x_t = x_t[0]
+        x = (x_t.permute(1,2,0).cpu().numpy() * 255).clip(0,255).astype(np.uint8)
         
         # Encode -> payload -> Decode (The EXACT evaluated path)
         payload = codec.encode(x)
-        recon = codec.decode(payload.raw_bytes)
+        assert len(payload) == args.budget, f"Payload is {len(payload)}B, expected {args.budget}B"
+        recon = codec.decode(payload)
         
         pairs.append((x, recon))
         

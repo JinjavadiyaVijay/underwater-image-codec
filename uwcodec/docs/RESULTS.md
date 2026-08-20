@@ -26,4 +26,23 @@ This document tracks measured results across the different phases of the project
 
 ---
 
-*(Future results for Training, Baselines, Ablations, and BLE to be appended here)*
+*(Future results for Baselines, Ablations, and BLE to be appended here)*
+
+## UWCodec v2 128B Final Evaluation (Phase 1)
+**Goal**: Evaluate the trained 128B checkpoint (outputs/v2/budget_128_final/best.pt) on the EUVP held-out set using the exact encode -> bytes -> decode path.
+
+### Metrics (EUVP Held-out, 2305 images)
+- **PSNR**: 19.7981 dB
+- **SSIM**: 0.4433
+- **MS-SSIM**: 0.7115
+- **UCIQE**: 0.1554
+- **Payload Size**: Exactly 128 bytes verified.
+
+### Visual Quality Assessment
+A 40-image visual comparison grid was generated (`outputs/v2/budget_128_final/visual_grid.png`) and manually inspected:
+- **Structural Preservation**: Very poor. While general color layouts are preserved, fine structure is completely lost.
+- **Object Shape**: Fish, starfish, and corals are reduced to vaguely recognizable color blobs.
+- **Hallucinations**: There are severe, ubiquitous "ring-like" artifacts dominating the reconstructions.
+- **Conclusion**: The current 128B model fails the visual gate. It is structurally unusable for downstream detailed tasks.
+
+**Status**: **FAIL** (Stopped at Phase 1. Diagnosis required before proceeding to smaller budgets or generalization tests).

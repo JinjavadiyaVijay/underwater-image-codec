@@ -35,6 +35,7 @@ class VectorQuantizer(nn.Module):
         # Codebook embeddings
         self.embedding = nn.Embedding(codebook_size, codebook_dim)
         self.embedding.weight.data.uniform_(-1.0 / codebook_size, 1.0 / codebook_size)
+        self.embedding.weight.requires_grad = False
 
         # EMA tracking
         self.register_buffer("_ema_cluster_size", torch.zeros(codebook_size))
@@ -54,11 +55,13 @@ class VectorQuantizer(nn.Module):
         # (B, H, W, D)
         z_flat = z.permute(0, 2, 3, 1).reshape(-1, D)
 
-        # Find nearest codebook entries
+        # Compute distances in float32 to prevent FP16 overflow
+        z_flat_f32 = z_flat.float()
+        emb_f32 = self.embedding.weight.float()
         dists = (
-            z_flat.pow(2).sum(dim=1, keepdim=True)
-            - 2 * z_flat @ self.embedding.weight.t()
-            + self.embedding.weight.pow(2).sum(dim=1, keepdim=True).t()
+            torch.sum(z_flat_f32**2, dim=1, keepdim=True)
+            + torch.sum(emb_f32**2, dim=1)
+            - 2 * torch.matmul(z_flat_f32, emb_f32.t())
         )
         indices = dists.argmin(dim=1)  # (B*H*W,)
 
@@ -67,13 +70,32 @@ class VectorQuantizer(nn.Module):
 
         # EMA codebook update (training only)
         if self.training:
-            encodings = F.one_hot(indices, self.codebook_size).float()
+            encodings = F.one_hot(indices, self.codebook_size).to(dtype=z_flat.dtype)
             self._ema_cluster_size.mul_(self.decay).add_(
-                encodings.sum(0), alpha=1 - self.decay
+                encodings.sum(0).to(dtype=self._ema_cluster_size.dtype), alpha=1 - self.decay
             )
             # EMA weight update (must detach z_flat to avoid memory leak in autograd graph)
             dw = encodings.t() @ z_flat.detach()
-            self._ema_w.mul_(self.decay).add_(dw, alpha=1 - self.decay)
+            self._ema_w.mul_(self.decay).add_(dw.to(dtype=self._ema_w.dtype), alpha=1 - self.decay)
+
+            # Dead code revival
+            dead_threshold = 1.0
+            dead_mask = self._ema_cluster_size < dead_threshold
+            if dead_mask.any():
+                num_dead = dead_mask.sum().item()
+                # Sample random vectors from the current batch
+                batch_size_flat = z_flat.shape[0]
+                rand_indices = torch.randperm(batch_size_flat, device=z.device)[:num_dead]
+                sampled_vectors = z_flat.detach()[rand_indices]
+                
+                if num_dead > batch_size_flat:
+                    sampled_vectors = sampled_vectors.repeat((num_dead // batch_size_flat) + 1, 1)[:num_dead]
+                
+                sampled_vectors = sampled_vectors.to(dtype=self._ema_w.dtype)
+                
+                # Reset EMA states for dead codes
+                self._ema_cluster_size[dead_mask] = dead_threshold
+                self._ema_w[dead_mask] = sampled_vectors * dead_threshold
 
             n = self._ema_cluster_size.sum()
             cluster_size = (
@@ -95,13 +117,15 @@ class VectorQuantizer(nn.Module):
         # Perplexity (codebook utilization)
         avg_probs = F.one_hot(indices, self.codebook_size).float().mean(0)
         perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
+        active_codes = (avg_probs > 0).sum().item()
 
         info = {
             "indices": indices.reshape(B, H, W),
             "commitment_loss": commitment_loss,
             "codebook_loss": codebook_loss,
             "perplexity": perplexity,
-            "vq_loss": codebook_loss + self.commitment_weight * commitment_loss,
+            "active_codes": active_codes,
+            "vq_loss": self.commitment_weight * commitment_loss,
         }
 
         return z_q, info
@@ -174,6 +198,7 @@ class ProductQuantizer(nn.Module):
             "indices": all_indices,  # list of (B, H, W) per group
             "vq_loss": total_vq_loss / self.num_groups,
             "perplexity": total_perplexity / self.num_groups,
+            "active_codes": 0, # not explicitly tracked for PQ right now
         }
 
         return z_q, info
@@ -225,6 +250,7 @@ class ResidualVQ(nn.Module):
         all_indices = []
         total_vq_loss = 0.0
         total_perplexity = 0.0
+        total_active_codes = 0.0
 
         for level, vq in enumerate(self.quantizers):
             z_q_level, info = vq(residual)
@@ -233,11 +259,14 @@ class ResidualVQ(nn.Module):
             all_indices.append(info["indices"])
             total_vq_loss = total_vq_loss + info["vq_loss"]
             total_perplexity = total_perplexity + info["perplexity"]
+            # Just take the last active_codes or average it
+            total_active_codes = total_active_codes + info["active_codes"]
 
         info = {
             "indices": all_indices,  # list of (B, H, W) per level
             "vq_loss": total_vq_loss / self.num_levels,
             "perplexity": total_perplexity / self.num_levels,
+            "active_codes": total_active_codes / self.num_levels,
         }
 
         return z_q_sum, info

@@ -234,11 +234,13 @@ class UWCodecV2(nn.Module):
         sem_q, sem_info = self.sem_rvq(sem_z)  # sem_q: (B, sem_dim, 4, 4)
         sem_vq_loss   = sem_info["vq_loss"]
         sem_perplexity = sem_info["perplexity"]
+        sem_active_codes = sem_info.get("active_codes", 0)
 
         # --- Quantize detail L1 ---
         det_q1, det_info1 = self.det_vq1(det_z)   # (B, det_dim, 8, 8)
         det_vq_loss   = det_info1["vq_loss"]
         det_perplexity = det_info1["perplexity"]
+        det_active_codes = det_info1.get("active_codes", 0)
 
         # Apply budget mask: zero positions not transmitted
         det_mask = self._make_det_mask(self.det_l1_tokens, device)  # (1,1,8,8)
@@ -250,6 +252,7 @@ class UWCodecV2(nn.Module):
             det_q2, det_info2 = self.det_vq2(det_residual)
             det_vq_loss = det_vq_loss + det_info2["vq_loss"]
             det_perplexity = (det_perplexity + det_info2["perplexity"]) / 2
+            det_active_codes = (det_active_codes + det_info2.get("active_codes", 0)) / 2
 
             # Mask: only first det_l2_tokens positions of L2 are transmitted
             det_mask_l2 = self._make_det_mask(self.det_l2_tokens, device)
@@ -265,6 +268,8 @@ class UWCodecV2(nn.Module):
             "vq_loss":        sem_vq_loss + det_vq_loss,
             "sem_perplexity": sem_perplexity,
             "det_perplexity": det_perplexity,
+            "sem_active_codes": sem_active_codes,
+            "det_active_codes": det_active_codes,
         }
 
     # ------------------------------------------------------------------
