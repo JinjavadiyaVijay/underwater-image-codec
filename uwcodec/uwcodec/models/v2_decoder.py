@@ -68,7 +68,7 @@ class Upsample2x(nn.Module):
         self.norm = _gn(out_ch)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
+        x = F.interpolate(x, scale_factor=2, mode="nearest")
         return F.silu(self.norm(self.conv(x)))
 
 
