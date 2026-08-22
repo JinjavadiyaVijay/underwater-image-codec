@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+Autoencode-D64-v0.1.0/
 
 # Datasets
 datasets/

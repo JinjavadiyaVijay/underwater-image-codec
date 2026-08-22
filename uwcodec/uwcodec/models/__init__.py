@@ -12,5 +12,9 @@ from uwcodec.models.decoder import ImageDecoder
 from uwcodec.models.v2_encoder import SemanticEncoder, DetailEncoder
 from uwcodec.models.v2_decoder import V2Decoder
 
+# V3 models
+from uwcodec.models.v3_encoder import V3Encoder
+from uwcodec.models.v3_decoder import V3Decoder
+
 # Quantizers (shared across versions)
 from uwcodec.models.quantizer import VectorQuantizer, ProductQuantizer, ResidualVQ
