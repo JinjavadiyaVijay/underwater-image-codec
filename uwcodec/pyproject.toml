@@ -51,10 +51,9 @@ all = [
     "uwcodec[detection,metrics,baselines,teacher,dev]",
 ]
 
-[project.scripts]
-uwcodec-oracle = "scripts.run_oracle:main"
-uwcodec-train = "scripts.train:main"
-uwcodec-eval = "scripts.evaluate:main"
+# Console scripts removed — use module execution instead:
+#   python -m uwcodec.training.train_v2 ...
+#   python scripts/eval_v2.py ...
 
 [tool.setuptools.packages.find]
 include = ["uwcodec*"]
